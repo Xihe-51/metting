@@ -1,0 +1,39 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="PyPackageRequirementsInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredPackages">
+        <list>
+          <option value="accelerate" />
+          <option value="alembic" />
+          <option value="comtypes" />
+          <option value="diffusers" />
+          <option value="flask-cors" />
+          <option value="Flask-Migrate" />
+          <option value="Flask-SQLAlchemy" />
+          <option value="huggingface-hub" />
+          <option value="importlib_resources" />
+          <option value="Mako" />
+          <option value="modelscope" />
+          <option value="PyMySQL" />
+          <option value="pypiwin32" />
+          <option value="pyttsx3" />
+          <option value="safetensors" />
+          <option value="soundfile" />
+          <option value="tokenizers" />
+          <option value="torch" />
+          <option value="torchaudio" />
+          <option value="torchvision" />
+          <option value="transformers" />
+        </list>
+      </option>
+    </inspection_tool>
+    <inspection_tool class="PyUnresolvedReferencesInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredIdentifiers">
+        <list>
+          <option value="module02" />
+        </list>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>
