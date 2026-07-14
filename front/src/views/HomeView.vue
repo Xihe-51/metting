@@ -6,6 +6,7 @@
         <span>{{ displayName }}</span>
         <el-button type="danger" size="small" @click="handleLogout">退出</el-button>
       </div>
+      <el-button @click="$router.push('/recordings')" type="default" size="small">录制回放</el-button>
     </div>
 
     <div class="main">
@@ -19,6 +20,16 @@
         <el-icon :size="48"><Link /></el-icon>
         <h2>加入会议</h2>
         <p>输入会议号加入已有会议</p>
+      </div>
+    </div>
+
+    <!-- 进行中的会议列表 -->
+    <div class="meeting-list" v-if="ongoingMeetings.length > 0">
+      <h3>进行中的会议</h3>
+      <div class="meeting-item" v-for="m in ongoingMeetings" :key="m.meeting_no">
+        <span>{{ m.title || '未命名会议' }} ({{ m.meeting_no }})</span>
+        <span class="count">{{ m.participant_count }} 人在线</span>
+        <el-button size="small" type="primary" @click="joinByNo(m.meeting_no)">加入</el-button>
       </div>
     </div>
 
@@ -51,7 +62,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import axios from 'axios'
@@ -68,27 +79,52 @@ const joining = ref(false)
 
 const createForm = ref({ title: '' })
 const joinForm = ref({ meetingNo: '' })
+const ongoingMeetings = ref<Array<{ meeting_no: string; title: string; participant_count: number }>>([])
+
+const getAuthHeaders = () => ({
+  headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+})
 
 const handleLogout = () => {
   localStorage.clear()
   router.push('/login')
 }
 
+const fetchMeetings = async () => {
+  try {
+    const res = await axios.get(`${API_BASE}/meetings`, getAuthHeaders())
+    ongoingMeetings.value = res.data.data?.ongoing || []
+  } catch {
+    // 静默失败
+  }
+}
+
 const handleCreate = async () => {
   creating.value = true
   try {
     const res = await axios.post(`${API_BASE}/meetings`, {
-      title: createForm.value.title,
-      creator_name: displayName
-    }, {
-      headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
-    })
-    ElMessage.success(`会议已创建，会议号: ${res.data.meeting_no}`)
+      title: createForm.value.title
+    }, getAuthHeaders())
+    const d = res.data.data
+    ElMessage.success(`会议已创建，会议号: ${d.meeting_no}`)
     showCreateDialog.value = false
+    router.push(`/meeting/${d.meeting_no}`)
   } catch (err: any) {
-    ElMessage.error(err.response?.data?.detail || '创建失败')
+    ElMessage.error(err.response?.data?.message || '创建失败')
   } finally {
     creating.value = false
+  }
+}
+
+const joinByNo = async (meetingNo: string) => {
+  joining.value = true
+  try {
+    await axios.post(`${API_BASE}/meetings/${meetingNo}/join`, {}, getAuthHeaders())
+    router.push(`/meeting/${meetingNo}`)
+  } catch (err: any) {
+    ElMessage.error(err.response?.data?.message || '加入失败')
+  } finally {
+    joining.value = false
   }
 }
 
@@ -97,21 +133,12 @@ const handleJoin = async () => {
     ElMessage.warning('请输入6位会议号')
     return
   }
-  joining.value = true
-  try {
-    await axios.post(`${API_BASE}/meetings/${joinForm.value.meetingNo}/join`, {
-      display_name: displayName
-    }, {
-      headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
-    })
-    ElMessage.success('加入成功')
-    router.push(`/meeting/${joinForm.value.meetingNo}`)
-  } catch (err: any) {
-    ElMessage.error(err.response?.data?.detail || '加入失败')
-  } finally {
-    joining.value = false
-  }
+  await joinByNo(joinForm.value.meetingNo)
 }
+
+onMounted(() => {
+  fetchMeetings()
+})
 </script>
 
 <style scoped>
@@ -136,7 +163,7 @@ const handleJoin = async () => {
   justify-content: center;
   align-items: center;
   gap: 40px;
-  min-height: 70vh;
+  min-height: 40vh;
   padding: 20px;
 }
 
@@ -161,4 +188,32 @@ const handleJoin = async () => {
 
 .card h2 { margin: 16px 0 8px; color: #333; }
 .card p { margin: 0; color: #999; font-size: 14px; }
+
+.meeting-list {
+  max-width: 600px;
+  margin: 0 auto;
+  padding: 0 20px 40px;
+}
+
+.meeting-list h3 {
+  color: white;
+  text-align: center;
+  margin-bottom: 16px;
+}
+
+.meeting-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: rgba(255,255,255,0.9);
+  padding: 12px 20px;
+  border-radius: 10px;
+  margin-bottom: 8px;
+}
+
+.count {
+  color: #999;
+  font-size: 13px;
+  margin: 0 12px;
+}
 </style>

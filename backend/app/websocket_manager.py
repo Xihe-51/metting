@@ -34,11 +34,12 @@ class ConnectionManager:
                 "id": participant_id,
                 "name": participant_info["name"],
                 "audio_on": participant_info["audio_on"],
-                "video_on": participant_info["video_on"]
+                "video_on": participant_info["video_on"],
+                "is_host": participant_info.get("is_host", False)
             }
         }, exclude_id=participant_id)
     
-    async def disconnect(self, meeting_no: str, participant_id: int):
+    async def disconnect(self, meeting_no: str, participant_id: int, reason: str = "left"):
         """断开连接"""
         if meeting_no in self.active_connections:
             if participant_id in self.active_connections[meeting_no]:
@@ -51,7 +52,7 @@ class ConnectionManager:
                 "type": "user_left",
                 "payload": {
                     "id": participant_id,
-                    "reason": "left"
+                    "reason": reason
                 }
             })
             
@@ -59,6 +60,32 @@ class ConnectionManager:
             if len(self.active_connections[meeting_no]) == 0:
                 del self.active_connections[meeting_no]
                 del self.participants_info[meeting_no]
+    
+    async def kick_participant(self, meeting_no: str, participant_id: int, kicked_by: str):
+        """主持人踢出参会者"""
+        # 先告诉被踢的人
+        await self.send_personal_message({
+            "type": "you_were_kicked",
+            "payload": {"by": kicked_by}
+        }, meeting_no, participant_id)
+        
+        # 关闭连接
+        if meeting_no in self.active_connections:
+            if participant_id in self.active_connections[meeting_no]:
+                try:
+                    await self.active_connections[meeting_no][participant_id].close()
+                except:
+                    pass
+        
+        # 从管理器中移除
+        await self.disconnect(meeting_no, participant_id, reason="kicked")
+    
+    def is_host(self, meeting_no: str, participant_id: int) -> bool:
+        """检查是否是主持人"""
+        if meeting_no in self.participants_info:
+            if participant_id in self.participants_info[meeting_no]:
+                return self.participants_info[meeting_no][participant_id].get("is_host", False)
+        return False
     
     async def send_personal_message(self, message: dict, meeting_no: str, participant_id: int):
         """发送个人消息"""
@@ -92,7 +119,8 @@ class ConnectionManager:
                 "name": info["name"],
                 "audio_on": info["audio_on"],
                 "video_on": info["video_on"],
-                "sharing_screen": info.get("sharing_screen", False)
+                "sharing_screen": info.get("sharing_screen", False),
+                "is_host": info.get("is_host", False)
             })
         return result
     

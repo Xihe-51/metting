@@ -57,12 +57,16 @@
 					<el-input v-model="registerForm.username" placeholder="用户名" prefix-icon="User" size="large" />
 				</el-form-item>
 
+				<el-form-item prop="display_name">
+					<el-input v-model="registerForm.display_name" placeholder="显示昵称" prefix-icon="User" size="large" />
+				</el-form-item>
+
 				<el-form-item prop="email">
 					<el-input v-model="registerForm.email" placeholder="邮箱" prefix-icon="Message" size="large" />
 				</el-form-item>
 
 				<el-form-item prop="phone">
-					<el-input v-model="registerForm.phone" placeholder="手机号 (可选)" prefix-icon="Iphone" size="large" />
+					<el-input v-model="registerForm.phone" placeholder="手机号 (可选)" prefix-icon="Phone" size="large" />
 				</el-form-item>
 
 				<el-form-item prop="password">
@@ -113,7 +117,7 @@
 					<el-button v-if="forgotStep > 1 && forgotStep < 3" @click="forgotStep--" class="step-button">
 						上一步
 					</el-button>
-					<el-button v-if="forgotStep < 3" type="primary" @click="forgotStep++" class="step-button">
+					<el-button v-if="forgotStep < 3" type="primary" @click="handleForgotStep" class="step-button" :loading="forgotLoading">
 						{{ forgotStep === 1 ? '发送验证码' : '重置密码' }}
 					</el-button>
 					<el-button v-if="forgotStep === 3" type="primary" @click="showForgotPassword = false"
@@ -219,17 +223,18 @@ const handleLogin = async () => {
     loading.value = true
     
     const res = await axios.post(`${API_BASE}/auth/login`, loginForm.value)
+    const d = res.data.data
     
-    localStorage.setItem('token', res.data.access_token)
-    localStorage.setItem('userId', String(res.data.user_id))
-    localStorage.setItem('username', res.data.username)
-    localStorage.setItem('displayName', res.data.display_name)
+    localStorage.setItem('token', d.access_token)
+    localStorage.setItem('userId', String(d.user_id))
+    localStorage.setItem('username', d.username)
+    localStorage.setItem('displayName', d.display_name)
     
-    ElMessage.success('登录成功')
+    ElMessage.success(res.data.message || '登录成功')
     router.push('/')
   } catch (error: any) {
     console.error('登录失败:', error)
-    ElMessage.error(error.response?.data?.detail || '登录失败，请检查用户名和密码')
+    ElMessage.error(error.response?.data?.message || '登录失败，请检查用户名和密码')
   } finally {
     loading.value = false
   }
@@ -248,17 +253,18 @@ const handleRegister = async () => {
       phone: registerForm.value.phone || undefined,
       password: registerForm.value.password
     })
+    const d = res.data.data
     
-    localStorage.setItem('token', res.data.access_token)
-    localStorage.setItem('userId', String(res.data.user_id))
-    localStorage.setItem('username', res.data.username)
-    localStorage.setItem('displayName', res.data.display_name)
+    localStorage.setItem('token', d.access_token)
+    localStorage.setItem('userId', String(d.user_id))
+    localStorage.setItem('username', d.username)
+    localStorage.setItem('displayName', d.display_name)
     
-    ElMessage.success('注册成功')
+    ElMessage.success(res.data.message || '注册成功')
     router.push('/')
   } catch (error: any) {
     console.error('注册失败:', error)
-    ElMessage.error(error.response?.data?.detail || '注册失败，请检查输入信息')
+    ElMessage.error(error.response?.data?.message || '注册失败，请检查输入信息')
   } finally {
     loading.value = false
   }
@@ -277,7 +283,7 @@ const handleForgotStep = async () => {
       ElMessage.success('验证码已发送')
       forgotStep.value = 2
     } catch (error: any) {
-      ElMessage.error(error.response?.data?.detail || '发送失败')
+      ElMessage.error(error.response?.data?.message || '发送失败')
     } finally {
       forgotLoading.value = false
     }
@@ -296,7 +302,7 @@ const handleForgotStep = async () => {
       ElMessage.success('密码重置成功')
       forgotStep.value = 3
     } catch (error: any) {
-      ElMessage.error(error.response?.data?.detail || '重置失败')
+      ElMessage.error(error.response?.data?.message || '重置失败')
     } finally {
       forgotLoading.value = false
     }
