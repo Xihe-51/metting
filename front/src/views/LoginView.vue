@@ -136,7 +136,7 @@ import { ElMessage, type FormInstance, type FormRules } from 'element-plus'
 import { useRouter } from 'vue-router'
 import axios from 'axios'
 
-const API_BASE = 'http://localhost:8000/api/v1'
+const API_BASE = '/api/v1'
 const router = useRouter()
 
 // 登录注册切换
