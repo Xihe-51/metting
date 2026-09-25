@@ -3,27 +3,43 @@
 注册、登录、忘记密码、JWT验证
 """
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from pydantic import BaseModel
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 from datetime import datetime, timedelta
 from fastapi.responses import JSONResponse
 from typing import Optional
+from uuid import uuid4
+import logging
 import random
 import os
 
-from app.database import get_db
+from app.database import get_db, SessionLocal
+from app.config import ALGORITHM, ACCESS_TOKEN_EXPIRE_HOURS, SECRET_KEY
 from app.models import User, VerificationCode
 from app.schemas import success, error
 
 router = APIRouter(prefix="/api/v1/auth", tags=["认证"])
 
-SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_HOURS = 24
-
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+logger = logging.getLogger("uvicorn.error")
+
+# 单个验证码允许的最大校验失败次数，超过即作废（防止 6 位码被暴力枚举）
+MAX_CODE_ATTEMPTS = 5
+# 验证码有效期（分钟）
+CODE_TTL_MINUTES = 10
+
+
+def _dev_mode_enabled() -> bool:
+    """仅当显式设置 AUTH_DEV_MODE=1 时才允许在响应中回显验证码（本地联调/自动化测试用）。
+
+    生产环境必须保持关闭，否则等同于任意账号可被接管。
+    """
+    return os.getenv("AUTH_DEV_MODE", "0") == "1"
 
 
 class RegisterRequest(BaseModel):
@@ -57,11 +73,49 @@ def get_password_hash(password):
     return pwd_context.hash(password)
 
 
-def create_access_token(data):
+def create_access_token(data: dict) -> str:
+    """签发 JWT
+
+    额外写入三个标准声明：
+    - iat：签发时间，便于判断 token 新旧与排查问题；
+    - jti：token 唯一标识，用于追踪单次签发（也为后续做黑名单留钩子）；
+    - ver 需由调用方通过 token_claims 传入，改密码后旧 token 立即失效。
+    """
     to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS)
-    to_encode.update({"exp": expire})
+    now = datetime.utcnow()
+    to_encode.update({
+        "iat": now,
+        "exp": now + timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS),
+        "jti": uuid4().hex,
+    })
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def token_claims(user: User) -> dict:
+    """签发 token 所需的声明（含 token 版本，供吊销校验使用）"""
+    return {"user_id": user.id, "username": user.username, "ver": user.token_version or 0}
+
+
+def resolve_user_from_token(token: str, db: Session) -> Optional[User]:
+    """解析 token 并返回对应用户，任一环节不合法都返回 None
+
+    返回 None 的情况：签名/格式无效、缺少 user_id、用户不存在、
+    token 的 ver 与用户当前 token_version 不一致
+    （不一致说明用户改过密码，此前签发的所有 token 必须立即作废）。
+    """
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    except JWTError:
+        return None
+    user_id = payload.get("user_id")
+    if user_id is None:
+        return None
+    user = db.query(User).filter(User.id == user_id).first()
+    if user is None:
+        return None
+    if payload.get("ver", 0) != (user.token_version or 0):
+        return None
+    return user
 
 
 def get_current_user(
@@ -71,16 +125,7 @@ def get_current_user(
     """JWT鉴权依赖，从 Header 手动解析 Token，无效时返回 None 而非抛异常"""
     if not authorization or not authorization.startswith("Bearer "):
         return None
-    token = authorization[7:]
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id = payload.get("user_id")
-        if user_id is None:
-            return None
-    except JWTError:
-        return None
-    user = db.query(User).filter(User.id == user_id).first()
-    return user
+    return resolve_user_from_token(authorization[7:], db)
 
 
 def require_auth(current_user: Optional[User] = Depends(get_current_user)) -> User:
@@ -113,7 +158,7 @@ def register(req: RegisterRequest, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(user)
 
-    token = create_access_token({"user_id": user.id, "username": user.username})
+    token = create_access_token(token_claims(user))
     return success({
         "access_token": token,
         "token_type": "bearer",
@@ -123,14 +168,26 @@ def register(req: RegisterRequest, db: Session = Depends(get_db)):
     }, "注册成功")
 
 
+def _authenticate(username: str, password: str):
+    """阻塞的认证逻辑（DB查询 + bcrypt校验），在线程池中执行"""
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.username == username).first()
+        if not user or not verify_password(password, user.password_hash):
+            return None
+        return user
+    finally:
+        db.close()
+
+
 @router.post("/login")
-def login(req: LoginRequest, db: Session = Depends(get_db)):
-    """用户登录"""
-    user = db.query(User).filter(User.username == req.username).first()
-    if not user or not verify_password(req.password, user.password_hash):
+async def login(req: LoginRequest):
+    """用户登录（async + 线程池，避免 bcrypt 阻塞事件循环）"""
+    user = await run_in_threadpool(_authenticate, req.username, req.password)
+    if not user:
         return JSONResponse(status_code=401, content=error(401, "用户名或密码错误"))
 
-    token = create_access_token({"user_id": user.id, "username": user.username})
+    token = create_access_token(token_claims(user))
     return success({
         "access_token": token,
         "token_type": "bearer",
@@ -142,34 +199,98 @@ def login(req: LoginRequest, db: Session = Depends(get_db)):
 
 @router.post("/send-code")
 def send_code(req: SendCodeRequest, db: Session = Depends(get_db)):
-    """发送验证码（忘记密码）"""
-    if not db.query(User).filter(User.email == req.email).first():
-        return JSONResponse(status_code=404, content=error(404, "该邮箱未注册"))
+    """发送验证码（忘记密码）
 
-    code = generate_code()
-    expires_at = datetime.utcnow() + timedelta(minutes=10)
-    db.query(VerificationCode).filter(VerificationCode.email == req.email).delete()
-    db.add(VerificationCode(email=req.email, code=code, expires_at=expires_at))
-    db.commit()
+    安全约束：
+    1. 响应体默认不回显验证码，验证码只能经邮件等服务端通道下发；
+       仅 AUTH_DEV_MODE=1（本地联调/自动化测试）时才在 data.code 中返回。
+    2. 无论邮箱是否已注册，都返回完全相同的成功文案，避免账号枚举。
+    """
+    user = db.query(User).filter(User.email == req.email).first()
 
-    print(f"验证码: {code} (发送至 {req.email})")
-    return success({"code": code}, "验证码已发送")
+    code = None
+    if user:
+        code = generate_code()
+        expires_at = datetime.utcnow() + timedelta(minutes=CODE_TTL_MINUTES)
+        db.query(VerificationCode).filter(VerificationCode.email == req.email).delete()
+        db.add(VerificationCode(email=req.email, code=code, expires_at=expires_at, attempts=0))
+        db.commit()
+        # TODO: 接入邮件服务后改为发送邮件；生产环境不打印验证码明文
+        logger.info("已为邮箱 %s 生成密码重置验证码", req.email)
+
+    if _dev_mode_enabled() and code:
+        return success({"code": code}, "验证码已发送")
+    return success(None, "验证码已发送")
 
 
 @router.post("/reset-password")
 def reset_password(req: ResetPasswordRequest, db: Session = Depends(get_db)):
-    """重置密码"""
+    """重置密码
+
+    安全约束：同一验证码连续校验失败达到 MAX_CODE_ATTEMPTS 次即作废，
+    避免 6 位数字验证码（90 万组合）在 10 分钟有效期内被暴力枚举。
+    """
     vc = db.query(VerificationCode).filter(
         VerificationCode.email == req.email, VerificationCode.code == req.code
     ).first()
+
     if not vc:
+        # 校验失败：对该邮箱当前有效的验证码累加失败次数，超限即删除
+        latest = db.query(VerificationCode).filter(
+            VerificationCode.email == req.email
+        ).order_by(VerificationCode.created_at.desc(), VerificationCode.id.desc()).first()
+        if latest:
+            # 并发猜测场景必须用原子 SQL 自增：多个请求同时读改写同一行会导致
+            # StaleDataError（UPDATE ... 0 were matched）而返回 500
+            db.query(VerificationCode).filter(
+                VerificationCode.id == latest.id
+            ).update(
+                {VerificationCode.attempts: func.coalesce(VerificationCode.attempts, 0) + 1},
+                synchronize_session=False
+            )
+            db.query(VerificationCode).filter(
+                VerificationCode.id == latest.id,
+                VerificationCode.attempts >= MAX_CODE_ATTEMPTS
+            ).delete(synchronize_session=False)
+            db.commit()
         return JSONResponse(status_code=400, content=error(400, "验证码错误"))
+
+    if (vc.attempts or 0) >= MAX_CODE_ATTEMPTS:
+        db.query(VerificationCode).filter(
+            VerificationCode.id == vc.id
+        ).delete(synchronize_session=False)
+        db.commit()
+        return JSONResponse(status_code=400, content=error(400, "验证码错误次数过多，请重新获取"))
+
     if vc.expires_at < datetime.utcnow():
         return JSONResponse(status_code=400, content=error(400, "验证码已过期"))
 
     user = db.query(User).filter(User.email == req.email).first()
-    user.password_hash = get_password_hash(req.new_password)
-    db.delete(vc)
+    if not user:
+        db.query(VerificationCode).filter(
+            VerificationCode.id == vc.id
+        ).delete(synchronize_session=False)
+        db.commit()
+        return JSONResponse(status_code=400, content=error(400, "验证码错误"))
+
+    # 先原子占用验证码（保证单次使用），再改密码；并发下未抢到的请求直接失败
+    claimed = db.query(VerificationCode).filter(
+        VerificationCode.id == vc.id
+    ).delete(synchronize_session=False)
+    if claimed == 0:
+        db.rollback()
+        return JSONResponse(status_code=400, content=error(400, "验证码已失效"))
+
+    # 改密码必须同时让此前签发的所有 token 立即失效：
+    # password_hash 与 token_version 用同一条原子 SQL 更新（并发改密不会互相覆盖），
+    # 旧 token 的 ver 声明随即与库中不一致，resolve_user_from_token 会拒绝它
+    db.query(User).filter(User.id == user.id).update(
+        {
+            User.password_hash: get_password_hash(req.new_password),
+            User.token_version: func.coalesce(User.token_version, 0) + 1,
+        },
+        synchronize_session=False,
+    )
     db.commit()
     return success(None, "密码重置成功")
 
@@ -245,8 +366,13 @@ def change_password(
     if len(req.new_password) < 6:
         return JSONResponse(status_code=400, content=error(400, "新密码至少6位"))
     current_user.password_hash = get_password_hash(req.new_password)
+    # 改密码 → 此前签发的 token 全部作废（token_version 自增）；
+    # 同时给当前会话换发新 token，避免用户刚改完密码就被自己踢下线
+    current_user.token_version = (current_user.token_version or 0) + 1
     db.commit()
-    return success(None, "密码修改成功")
+    db.refresh(current_user)
+    new_token = create_access_token(token_claims(current_user))
+    return success({"access_token": new_token, "token_type": "bearer"}, "密码修改成功")
 
 
 UPLOAD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "uploads")

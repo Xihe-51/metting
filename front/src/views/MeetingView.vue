@@ -263,6 +263,9 @@
           <div class="video-card" :class="{ speaking: p.speaking }" v-for="p in remotePeers" :key="p.id">
             <div class="card-media">
               <video :ref="el => setVideoRef(p.id, el as HTMLVideoElement)" autoplay playsinline></video>
+              <div class="peer-issue" v-if="peerIssues[p.id]">
+                {{ peerIssues[p.id] === 'retrying' ? '连接重连中…' : '连接已中断，请刷新页面' }}
+              </div>
               <div class="avatar-placeholder" v-if="!p.videoOn">
                 <img v-if="p.avatarUrl" :src="API_STATIC + p.avatarUrl" class="avatar-img-large" />
                 <span v-else class="avatar-letter" :style="{ background: avatarColor(p.name) }">
@@ -479,6 +482,9 @@
           </svg>
         </template>
         <span>{{ videoOn ? '摄像头' : '已关闭' }}</span>
+        <span class="seat-badge" :class="{ full: videoSeatUsed >= videoSeatLimit && !videoOn }">
+          视频 {{ videoSeatUsed }}/{{ videoSeatLimit }}
+        </span>
       </button>
       <div class="bg-picker-wrap">
         <button :class="['ctrl-btn', { on: virtualBg !== 'none' }]" @click="showBgPicker = !showBgPicker">
@@ -593,6 +599,8 @@ const recCanvasRef = ref<HTMLCanvasElement>()
 let mediaRecorder: MediaRecorder | null = null
 let recAnimFrame = 0
 let pendingChunkUploads = new Set<Promise<void>>()
+// 录制分片序号：序号顺序即录制时序，后端据此重排落盘（分片是并发上传的）
+let chunkSeq = 0
 const recordingId = ref<number | null>(null)
 const needPassword = ref(false)
 const joinPassword = ref('')
@@ -621,6 +629,35 @@ const localStream = ref<MediaStream | null>(null)
 const screenStream = ref<MediaStream | null>(null)
 const peerConnections = new Map<number, RTCPeerConnection>()
 const videoRefs = new Map<number, HTMLVideoElement>()
+// 远端媒体流：用 addTransceiver 预建 m-line 时 ontrack 的 e.streams 可能为空，
+// 因此按对端自行聚合音视频轨，保证 video 元素总能拿到完整流
+const remoteStreams = new Map<number, MediaStream>()
+
+// ===== Perfect negotiation 状态（每个对端一份）=====
+// 双向同时发 offer（glare）时浏览器会抛
+// InvalidStateError: Called in wrong state: have-local-offer。
+// 旧实现既不捕获该异常也不回滚，会让这一对连接永久卡在 have-local-offer：
+// 双方静默黑屏、没有任何提示、也无法自愈。
+// 规则：一对连接里恰好一方 polite（收到碰撞 offer 时回滚自己的 offer），
+// 另一方 impolite（丢弃对方的碰撞 offer），两端据此收敛到同一份 SDP。
+interface PeerNegotiationState {
+  makingOffer: boolean
+  ignoreOffer: boolean
+  settingRemoteAnswer: boolean
+  iceRestarts: number
+}
+const negotiationStates = new Map<number, PeerNegotiationState>()
+
+// 连接异常标记：retrying = 正在重连，broken = 已放弃（需刷新页面）
+const peerIssues = ref<Record<number, 'retrying' | 'broken'>>({})
+const peerIssueTimers = new Map<number, number>()
+
+// 同时开摄像头的人数上限，由后端在入会时下发（默认 4）
+const videoSeatLimit = ref(4)
+
+// ICE 失败后的重试策略：最多重启 3 次，逐次退避
+const ICE_RESTART_MAX = 3
+const ICE_RESTART_DELAY_MS = 3000
 
 interface RemotePeer {
   id: number
@@ -820,11 +857,13 @@ const joinMeeting = async (password = '') => {
     inWaitingRoom.value = data.status === 'waiting'
     needPassword.value = false
     joinPasswordError.value = ''
-    // 附加 JWT，供 WebSocket 服务端鉴权
-    const token = localStorage.getItem('token') || ''
-    // 用当前页面访问地址构建 WebSocket，避免局域网下后端返回 localhost 导致连接失败
+    // 用当前页面访问地址构建 WebSocket，避免局域网下后端返回 localhost 导致连接失败。
+    // token 不再放在 URL：URL 会进入 access log、浏览器历史与代理记录，
+    // 改由连接建立后的首帧 {"type":"auth"} 上报（见 connectWebSocket）。
     const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const wsUrl = `${wsProtocol}//${window.location.host}/api/v1/ws/${meetingNo}?participant_id=${myParticipantId}&token=${encodeURIComponent(token)}`
+    const wsUrl = `${wsProtocol}//${window.location.host}/api/v1/ws/${meetingNo}?participant_id=${myParticipantId}`
+    // ICE 配置（STUN/TURN）由后端统一下发，入会前拉取并缓存
+    await getIceConfig()
     return wsUrl
   } catch (err: any) {
     const msg = err.response?.data?.message || '加入失败'
@@ -889,6 +928,8 @@ const startLocalStream = async () => {
     }
     localStream.value = stream
     if (localVideoRef.value) localVideoRef.value.srcObject = stream
+    // 连接可能先于本地流建立（此时 sender 上没有轨道），这里补挂一次
+    syncLocalSenders()
     initVoiceDetection(stream)
   } catch {
     ElMessage.error('无法访问摄像头')
@@ -897,7 +938,8 @@ const startLocalStream = async () => {
 
 // ===== 语音激励：检测本地音量并广播说话状态 =====
 let voiceAnalyser: AnalyserNode | null = null
-let voiceDataArray: Uint8Array | null = null
+// 显式写成 Uint8Array<ArrayBuffer>：DOM 的 getByteTimeDomainData 只接受 ArrayBuffer 支撑的视图
+let voiceDataArray: Uint8Array<ArrayBuffer> | null = null
 let speakingSent = false
 let voiceCheckInterval: number | null = null
 
@@ -915,7 +957,8 @@ const initVoiceDetection = (stream: MediaStream) => {
       voiceAnalyser.getByteTimeDomainData(voiceDataArray)
       let sum = 0
       for (let i = 0; i < voiceDataArray.length; i++) {
-        const v = (voiceDataArray[i] - 128) / 128
+        // 越界取不到时按静音基准值 128 处理（正常不会发生）
+        const v = ((voiceDataArray[i] ?? 128) - 128) / 128
         sum += v * v
       }
       const rms = Math.sqrt(sum / voiceDataArray.length)
@@ -1015,8 +1058,10 @@ const enumerateDevices = async () => {
     const all = await navigator.mediaDevices.enumerateDevices()
     devices.value.video = all.filter(d => d.kind === 'videoinput')
     devices.value.audio = all.filter(d => d.kind === 'audioinput')
-    if (!selectedVideoId.value && devices.value.video.length) selectedVideoId.value = devices.value.video[0].deviceId
-    if (!selectedAudioId.value && devices.value.audio.length) selectedAudioId.value = devices.value.audio[0].deviceId
+    const firstVideo = devices.value.video[0]
+    const firstAudio = devices.value.audio[0]
+    if (!selectedVideoId.value && firstVideo) selectedVideoId.value = firstVideo.deviceId
+    if (!selectedAudioId.value && firstAudio) selectedAudioId.value = firstAudio.deviceId
   } catch {
     /* */
   }
@@ -1046,7 +1091,7 @@ const startMicLevel = (stream: MediaStream) => {
       analyser.getByteTimeDomainData(data)
       let sum = 0
       for (let i = 0; i < data.length; i++) {
-        const v = (data[i] - 128) / 128
+        const v = ((data[i] ?? 128) - 128) / 128
         sum += v * v
       }
       micLevel.value = Math.min(100, Math.round(Math.sqrt(sum / data.length) * 300))
@@ -1131,7 +1176,9 @@ const toggleAudio = () => {
 
 const toggleVideo = () => {
   videoOn.value = !videoOn.value
-  localStream.value?.getVideoTracks().forEach(t => t.enabled = videoOn.value)
+  // 开关摄像头只做 replaceTrack，不重新协商（见 syncLocalSenders）。
+  // 乐观开启：若服务端判定席位已满，会回 video_denied，前端据此回滚。
+  syncLocalSenders()
   sendDeviceStatus()
 }
 
@@ -1147,13 +1194,9 @@ const setVirtualBg = async (type: 'none' | 'blur' | 'image') => {
   // 恢复原始视频流（远端 + 本地预览）
   const restoreOriginalTrack = () => {
     if (localStream.value) {
-      const videoTrack = localStream.value.getVideoTracks()[0]
-      if (videoTrack) {
-        for (const pc of peerConnections.values()) {
-          const sender = pc.getSenders().find(s => s.track?.kind === 'video')
-          if (sender) sender.replaceTrack(videoTrack)
-        }
-      }
+      // 统一走 syncLocalSenders：关闭摄像头（无席位）时切虚拟背景，
+      // 不能把画面又发出去
+      syncLocalSenders()
       // 恢复本地预览
       if (localVideoRef.value) {
         localVideoRef.value.srcObject = localStream.value
@@ -1241,17 +1284,17 @@ const setVirtualBg = async (type: 'none' | 'blur' | 'image') => {
       const pixelCount = maskW * maskH
 
       for (let i = 0; i < pixelCount; i++) {
-        const isPerson = maskData[i] > 0.5
+        const isPerson = (maskData[i] ?? 0) > 0.5
         const p = i * 4
         if (isPerson) {
-          od[p] = vd[p]
-          od[p + 1] = vd[p + 1]
-          od[p + 2] = vd[p + 2]
+          od[p] = vd[p] ?? 0
+          od[p + 1] = vd[p + 1] ?? 0
+          od[p + 2] = vd[p + 2] ?? 0
           od[p + 3] = 255
         } else {
-          od[p] = bd[p]
-          od[p + 1] = bd[p + 1]
-          od[p + 2] = bd[p + 2]
+          od[p] = bd[p] ?? 0
+          od[p + 1] = bd[p + 1] ?? 0
+          od[p + 2] = bd[p + 2] ?? 0
           od[p + 3] = 255
         }
       }
@@ -1290,10 +1333,11 @@ const setVirtualBg = async (type: 'none' | 'blur' | 'image') => {
   bgStream.value = newStream
   const newTrack = newStream.getVideoTracks()[0]
 
-  // 替换远端轨道
-  for (const pc of peerConnections.values()) {
-    const sender = pc.getSenders().find(s => s.track?.kind === 'video')
-    if (sender) sender.replaceTrack(newTrack)
+  // 替换远端轨道（虚拟背景是本地画面处理，同样受摄像头开关控制）
+  if (newTrack && videoOn.value) {
+    for (const pc of peerConnections.values()) {
+      findVideoSender(pc)?.replaceTrack(newTrack).catch(() => { /* 轨道已结束，忽略 */ })
+    }
   }
   // 本地预览也显示虚拟背景效果
   if (localVideoRef.value) {
@@ -1320,22 +1364,20 @@ const toggleScreen = async () => {
     screenStream.value?.getTracks().forEach(t => t.stop())
     screenStream.value = null
     sharingScreen.value = false
-    const vt = localStream.value?.getVideoTracks()[0]
-    peerConnections.forEach(pc => {
-      const s = pc.getSenders().find(s => s.track?.kind === 'video')
-      if (s && vt) s.replaceTrack(vt)
-    })
+    // 恢复为本地摄像头画面（关闭摄像头 / 无席位时自动置 null，不会误发）
+    syncLocalSenders()
     sendScreenStatus()
   } else {
     try {
       const stream = await navigator.mediaDevices.getDisplayMedia({ video: true })
+      const st = stream.getVideoTracks()[0]
+      if (!st) return
       screenStream.value = stream
       sharingScreen.value = true
-      const st = stream.getVideoTracks()[0]
-      peerConnections.forEach(pc => {
-        const s = pc.getSenders().find(s => s.track?.kind === 'video')
-        if (s) s.replaceTrack(st)
-      })
+      // 屏幕共享是独立于摄像头的共享场景，不受视频席位限制
+      for (const pc of peerConnections.values()) {
+        findVideoSender(pc)?.replaceTrack(st).catch(() => { /* 轨道已结束，忽略 */ })
+      }
       st.onended = () => {
         toggleScreen()
       }
@@ -1385,7 +1427,28 @@ const toggleRecording = async () => {
   }
 }
 
-const uploadChunk = async (blob: Blob) => {
+// 分片被服务端配额拒绝（413）后的收尾：提示用户 → 停录 → 通知后端落库
+// 用标志位去重：并发上传的多个分片会同时拿到 413，只处理一次
+let quotaStopInProgress = false
+const stopRecordingByQuota = async (msg: string) => {
+  if (quotaStopInProgress) return
+  quotaStopInProgress = true
+  ElMessage.error(msg)
+  try {
+    await stopRecorder()
+    if (recordingId.value) {
+      await axios.post(`${API_BASE}/meetings/${meetingNo}/recordings/${recordingId.value}/stop`, {}, getAuthHeaders())
+    }
+  } catch (err) {
+    console.error('配额超限后停止录制失败:', err)
+  } finally {
+    recording.value = false
+    recordingId.value = null
+    quotaStopInProgress = false
+  }
+}
+
+const uploadChunk = async (blob: Blob, seq: number) => {
   if (!recordingId.value) return
   const p = (async () => {
     try {
@@ -1393,11 +1456,28 @@ const uploadChunk = async (blob: Blob) => {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${localStorage.getItem('token') || ''}`,
-          'Content-Type': 'application/octet-stream'
+          'Content-Type': 'application/octet-stream',
+          // 带上分片序号：多个分片是并发上传的，到达顺序不保证等于录制时序
+          'X-Chunk-Seq': String(seq)
         },
         body: blob
       })
-      if (!res.ok) console.warn('录制分片上传失败:', res.status)
+      if (!res.ok) {
+        // 413 = 超出服务端录制配额（单片/单场/磁盘总量）。再录下去只会持续丢分片，
+        // 直接停止录制并告知用户，而不是静默产生一个残缺的录像。
+        if (res.status === 413) {
+          let msg = '录制已超出服务端配额，录制已停止'
+          try {
+            const body = await res.json()
+            msg = body?.message || msg
+          } catch { /* 响应体非 JSON 时用默认提示 */ }
+          // 这里不能 await：本函数自身还在 pendingChunkUploads 集合里，
+          // 而停录流程要等待该集合清空，互相等待会死锁
+          void stopRecordingByQuota(msg)
+        } else {
+          console.warn('录制分片上传失败:', res.status)
+        }
+      }
     } catch {
       console.warn('录制分片上传网络错误')
     }
@@ -1468,6 +1548,7 @@ const startRecorder = async () => {
   }
 
   const videoTrack = canvas.captureStream(30).getVideoTracks()[0]
+  if (!videoTrack) throw new Error('无法创建录制视频轨道')
   const audioTrack = localStream.value.getAudioTracks()[0]
   const combined = new MediaStream([videoTrack])
   if (audioTrack) combined.addTrack(audioTrack.clone())
@@ -1484,7 +1565,7 @@ const startRecorder = async () => {
 
   mediaRecorder.ondataavailable = (e) => {
     console.log('录制: dataavailable, size:', e.data.size)
-    if (e.data.size > 0) uploadChunk(e.data)
+    if (e.data.size > 0) uploadChunk(e.data, chunkSeq++)
   }
 
   mediaRecorder.onerror = (e) => {
@@ -1495,6 +1576,8 @@ const startRecorder = async () => {
   mediaRecorder.onstart = () => console.log('录制: MediaRecorder 已开始')
   mediaRecorder.onstop = () => console.log('录制: MediaRecorder 已停止')
 
+  // 每次开始录制都从 0 重新计数，保证序号与本次录制的时序严格对应
+  chunkSeq = 0
   mediaRecorder.start(1000)
   console.log('录制: 已调用 start(1000), state:', mediaRecorder.state)
 
@@ -1525,8 +1608,20 @@ const stopRecorder = async () => {
 
 type QualityConfig = { width: number; height: number; scaleDown: number; fps: number; bitrate: number }
 
+// 大会议自动画质封顶：Mesh 下每人上行 ≈ 对端数 × 单路码率，
+// 对端数 ≥ 12 时 auto 若升到高清，单路 2Mbps × 15 对端 = 30Mbps，
+// 百兆局域网与 WiFi 都扛不住；因此自动模式在此规模封顶为标清。
+const AUTO_QUALITY_PEER_CAP = 12
+
+const clampAutoQuality = (config: QualityConfig): QualityConfig => {
+  if (peerConnections.size < AUTO_QUALITY_PEER_CAP) return config
+  return config.bitrate > qualityConfigs.medium.bitrate ? qualityConfigs.medium : config
+}
+
 const applyVideoQuality = async (pc: RTCPeerConnection, config: QualityConfig) => {
-  const sender = pc.getSenders().find(s => s.track?.kind === 'video')
+  // 按 transceiver 定位视频 sender：无席位时 sender.track 为 null，
+  // 用 track.kind 查找会直接放弃设置编码参数
+  const sender = findVideoSender(pc)
   if (!sender) return
   const params = sender.getParameters()
   if (!params.encodings) params.encodings = [{}]
@@ -1576,7 +1671,7 @@ const changeCameraResolution = async (config: QualityConfig) => {
 
 const cycleQuality = () => {
   const idx = qualityModes.indexOf(qualityMode.value)
-  const next = qualityModes[(idx + 1) % qualityModes.length]
+  const next: QualityMode = qualityModes[(idx + 1) % qualityModes.length] ?? 'auto'
   qualityMode.value = next
   const cfg = qualityConfigs[next]
   ElMessage.success(`画质：${qualityLabels[next]}`)
@@ -1615,7 +1710,8 @@ const startQualityMonitor = () => {
         } else {
           config = 'high'
         }
-        applyVideoQuality(pc, qualityConfigs[config])
+        // 大会议护栏：对端多时不允许 auto 升到高清（见 clampAutoQuality）
+        applyVideoQuality(pc, clampAutoQuality(qualityConfigs[config]))
       } catch {
         // 获取统计数据可能失败，忽略
       }
@@ -1676,60 +1772,272 @@ const sendScreenStatus = () => {
   ws?.send(JSON.stringify({ type: 'screen', payload: { sharing: sharingScreen.value } }))
 }
 
+// ICE 配置（STUN/TURN）由后端 /api/v1/config/ice 下发并缓存：
+// 纯局域网下 iceServers 为空数组，此时不传 iceServers，
+// 浏览器只用 host 候选直连（最快），也不会去等不可达的公网 STUN。
+let cachedIceServers: RTCIceServer[] = []
+let iceConfigFetchedAt = 0
+let iceConfigTtlMs = 600 * 1000
+
+const getIceConfig = async () => {
+  if (iceConfigFetchedAt && Date.now() - iceConfigFetchedAt < iceConfigTtlMs) {
+    return cachedIceServers
+  }
+  try {
+    const res = await axios.get(`${API_BASE}/config/ice`, getAuthHeaders())
+    const d = res.data.data || {}
+    cachedIceServers = Array.isArray(d.iceServers) ? d.iceServers : []
+    iceConfigTtlMs = (Number(d.ttl) || 600) * 1000
+    iceConfigFetchedAt = Date.now()
+  } catch (err) {
+    // 拉取失败不能让用户入不了会：退回 host-only，局域网直连仍然可用
+    console.warn('获取 ICE 配置失败，本次使用局域网直连（host 候选）', err)
+  }
+  return cachedIceServers
+}
+
+const negotiationStateOf = (remoteId: number): PeerNegotiationState => {
+  let st = negotiationStates.get(remoteId)
+  if (!st) {
+    st = { makingOffer: false, ignoreOffer: false, settingRemoteAnswer: false, iceRestarts: 0 }
+    negotiationStates.set(remoteId, st)
+  }
+  return st
+}
+
+// participant_id 全局唯一且递增：id 小的一方固定 polite、id 大的一方固定 impolite，
+// 保证任意一对连接里恰好一个 polite、一个 impolite
+const isPolitePeer = (remoteId: number) => myParticipantId < remoteId
+
+// 视频 sender 必须按 transceiver 查找：视频席位机制下「未拿到席位」的人
+// sender.track 为 null（replaceTrack(null) 后不再发送视频），
+// 沿用 track?.kind === 'video' 的旧写法会直接找不到 sender，画质设置随之失效
+const findVideoSender = (pc: RTCPeerConnection): RTCRtpSender | null => {
+  const tr = pc.getTransceivers().find(t => t.receiver.track?.kind === 'video')
+  if (tr) return tr.sender
+  return pc.getSenders().find(s => s.track?.kind === 'video') ?? null
+}
+
+const findAudioSender = (pc: RTCPeerConnection): RTCRtpSender | null => {
+  const tr = pc.getTransceivers().find(t => t.receiver.track?.kind === 'audio')
+  if (tr) return tr.sender
+  return pc.getSenders().find(s => s.track?.kind === 'audio') ?? null
+}
+
+/**
+ * 把本地音视频轨同步到全部连接。
+ *
+ * 视频开关只做 replaceTrack（拿不到席位时 replaceTrack(null) 停止发送），
+ * replaceTrack 不触发 negotiationneeded，因此开/关摄像头是瞬时的，
+ * 也不会引入新的信令碰撞（glare）风险 —— 这正是视频席位机制成立的前提。
+ */
+const syncLocalSenders = () => {
+  const audioTrack = localStream.value?.getAudioTracks()[0] ?? null
+  const videoTrack = videoOn.value ? (localStream.value?.getVideoTracks()[0] ?? null) : null
+  localStream.value?.getVideoTracks().forEach(t => { t.enabled = videoOn.value })
+  localStream.value?.getAudioTracks().forEach(t => { t.enabled = audioOn.value })
+  for (const pc of peerConnections.values()) {
+    const vs = findVideoSender(pc)
+    if (vs && vs.track !== videoTrack) {
+      vs.replaceTrack(videoTrack).catch(() => { /* 轨道已结束，忽略 */ })
+    }
+    const as = findAudioSender(pc)
+    if (as && as.track !== audioTrack) {
+      as.replaceTrack(audioTrack).catch(() => { /* 同上 */ })
+    }
+  }
+}
+
+const markPeerIssue = (remoteId: number, level: 'retrying' | 'broken') => {
+  peerIssues.value = { ...peerIssues.value, [remoteId]: level }
+  if (level === 'broken') {
+    const peer = remotePeers.value.find(p => p.id === remoteId)
+    ElMessage.warning(`与「${peer?.name || '对方'}」的连接已中断，请刷新页面重新入会`)
+  }
+}
+
+const clearPeerIssue = (remoteId: number) => {
+  if (!(remoteId in peerIssues.value)) return
+  const next = { ...peerIssues.value }
+  delete next[remoteId]
+  peerIssues.value = next
+}
+
+/**
+ * ICE 连接状态处理：连接失败必须能自愈并告知用户。
+ *
+ * 旧实现没有监听该事件，连接进入 failed 后既不重连也不提示，
+ * 而建连处的幂等守卫看到「pc 存在且非 closed」就直接复用，
+ * 于是该成员整场会议永久黑屏 —— 16 人规模下每人 15 条连接，
+ * 只要有一条失败就会出现这种「某个人的画面永远不出来」的故障。
+ */
+const handleIceStateChange = (remoteId: number, pc: RTCPeerConnection) => {
+  const state = pc.iceConnectionState
+  const st = negotiationStateOf(remoteId)
+  if (state === 'failed') {
+    if (st.iceRestarts >= ICE_RESTART_MAX) {
+      // 重试用尽仍失败：明确告知而不是静默黑屏
+      markPeerIssue(remoteId, 'broken')
+      return
+    }
+    st.iceRestarts++
+    markPeerIssue(remoteId, 'retrying')
+    const pending = peerIssueTimers.get(remoteId)
+    if (pending) clearTimeout(pending)
+    // 退避重启：立即重试通常还是拿到同一批已失效的候选
+    peerIssueTimers.set(remoteId, window.setTimeout(() => {
+      peerIssueTimers.delete(remoteId)
+      if (pc.signalingState === 'closed') return
+      if (typeof pc.restartIce === 'function') {
+        // restartIce() 会触发 negotiationneeded，由 perfect negotiation 重新协商
+        pc.restartIce()
+      } else {
+        // 极老浏览器没有 restartIce：重建 pc 会让重试计数清零而陷入无限重建，
+        // 因此直接判定为不可自愈并明确告知用户
+        markPeerIssue(remoteId, 'broken')
+      }
+    }, ICE_RESTART_DELAY_MS * st.iceRestarts))
+  } else if (state === 'connected' || state === 'completed') {
+    st.iceRestarts = 0
+    clearPeerIssue(remoteId)
+  }
+}
+
+/**
+ * 发起协商（offer）。异常必须就地吞掉：
+ * onnegotiationneeded 回调里的 rejection 不会被任何人处理，
+ * 且连接会静默停在原地 —— 旧实现的黑屏根因之一。
+ */
+const sendOfferTo = async (remoteId: number, pc: RTCPeerConnection) => {
+  const st = negotiationStateOf(remoteId)
+  try {
+    st.makingOffer = true
+    await pc.setLocalDescription(await pc.createOffer())
+    ws?.send(JSON.stringify({ type: 'offer', payload: { target_id: remoteId, sdp: pc.localDescription } }))
+  } catch (err) {
+    console.warn('发起协商失败', remoteId, err)
+  } finally {
+    st.makingOffer = false
+  }
+}
+
 const createPeerConnection = (remoteId: number): RTCPeerConnection => {
-  // 配置 STUN 服务器：跨公网/NAT 时通过 STUN 获取公网候选地址打洞；局域网内仍走 host 候选直连
-  const pc = new RTCPeerConnection({
-    iceServers: [
-      { urls: 'stun:stun.l.google.com:19302' },
-      { urls: 'stun:stun1.l.google.com:19302' }
-    ]
-  })
+  const config: RTCConfiguration = {}
+  // 为空数组时保持 undefined：显式传空 iceServers 与不传在部分浏览器表现不一致
+  if (cachedIceServers.length) config.iceServers = cachedIceServers
+  const pc = new RTCPeerConnection(config)
   peerConnections.set(remoteId, pc)
-  localStream.value?.getTracks().forEach(t => pc.addTrack(t, localStream.value!))
-  // 应用当前画质设置
-  applyVideoQuality(pc, qualityConfigs[qualityMode.value])
+
+  // 先绑事件再添加轨道：negotiationneeded 是异步派发的，必须在同一同步块内绑定
+  pc.onnegotiationneeded = () => { void sendOfferTo(remoteId, pc) }
+  pc.oniceconnectionstatechange = () => handleIceStateChange(remoteId, pc)
   pc.onicecandidate = (e) => {
     if (e.candidate) {
       ws?.send(JSON.stringify({ type: 'ice', payload: { target_id: remoteId, candidate: e.candidate } }))
     }
   }
   pc.ontrack = (e) => {
+    // 用 addTransceiver 预建 m-line 时 ontrack 的 e.streams 可能为空，
+    // 因此按对端聚合 MediaStream，不依赖 e.streams[0]
+    let ms = remoteStreams.get(remoteId)
+    if (!ms) {
+      ms = new MediaStream()
+      remoteStreams.set(remoteId, ms)
+    }
+    if (!ms.getTracks().some(t => t.id === e.track.id)) ms.addTrack(e.track)
     const v = videoRefs.get(remoteId)
-    if (v && e.streams[0]) v.srcObject = e.streams[0]
+    if (v && v.srcObject !== ms) v.srcObject = ms
   }
+
+  // 预建音视频 m-line：媒体开关此后只走 replaceTrack，不再重新协商。
+  // 这样也顺带修掉了「建连时本地流尚未就绪 → 该连接永远没有音频」的隐患。
+  pc.addTransceiver('audio', { direction: 'sendrecv' })
+  pc.addTransceiver('video', { direction: 'sendrecv' })
+  syncLocalSenders()
+  // 应用当前画质设置（自动模式下走大会议封顶，避免对端多时按 auto/high 推流）
+  applyVideoQuality(
+    pc,
+    qualityMode.value === 'auto' ? clampAutoQuality(qualityConfigs.auto) : qualityConfigs[qualityMode.value]
+  )
   return pc
 }
 
-const createOfferForPeer = async (remoteId: number) => {
-  const pc = createPeerConnection(remoteId)
-  const offer = await pc.createOffer()
-  await pc.setLocalDescription(offer)
-  ws?.send(JSON.stringify({ type: 'offer', payload: { target_id: remoteId, sdp: pc.localDescription } }))
+/** 幂等建连：已有可用连接时直接复用（重建会泄漏旧连接并造成画面闪断） */
+const ensurePeerConnection = (remoteId: number): RTCPeerConnection => {
+  const existing = peerConnections.get(remoteId)
+  if (existing && existing.signalingState !== 'closed') return existing
+  return createPeerConnection(remoteId)
 }
 
-const handleOffer = async (fromId: number, sdp: RTCSessionDescriptionInit) => {
+/**
+ * 处理远端 SDP（offer / answer），实现 perfect negotiation。
+ *
+ * 碰撞时（双方同时发 offer）polite 方靠 setRemoteDescription 的隐式回滚
+ * 放弃自己的 offer 并应答对方的；impolite 方丢弃对方的碰撞 offer。
+ * 旧实现两处都缺，因此一方会直接抛
+ * InvalidStateError: Called in wrong state: have-local-offer，该对连接永久卡死。
+ */
+const handleDescription = async (fromId: number, sdp: RTCSessionDescriptionInit) => {
   let pc = peerConnections.get(fromId)
-  if (!pc) pc = createPeerConnection(fromId)
-  await pc.setRemoteDescription(new RTCSessionDescription(sdp))
-  const answer = await pc.createAnswer()
-  await pc.setLocalDescription(answer)
-  ws?.send(JSON.stringify({ type: 'answer', payload: { target_id: fromId, sdp: pc.localDescription } }))
-}
+  if (!pc || pc.signalingState === 'closed') pc = createPeerConnection(fromId)
+  const st = negotiationStateOf(fromId)
+  const description = new RTCSessionDescription(sdp)
+  try {
+    const readyForOffer = !st.makingOffer &&
+      (pc.signalingState === 'stable' || st.settingRemoteAnswer)
+    const offerCollision = description.type === 'offer' && !readyForOffer
 
-const handleAnswer = async (fromId: number, sdp: RTCSessionDescriptionInit) => {
-  const pc = peerConnections.get(fromId)
-  if (pc) await pc.setRemoteDescription(new RTCSessionDescription(sdp))
+    st.ignoreOffer = !isPolitePeer(fromId) && offerCollision
+    if (st.ignoreOffer) return
+
+    st.settingRemoteAnswer = description.type === 'answer'
+    // polite 方处于 have-local-offer 时，浏览器会在此隐式回滚本地 offer
+    await pc.setRemoteDescription(description)
+    st.settingRemoteAnswer = false
+
+    if (description.type === 'offer') {
+      await pc.setLocalDescription(await pc.createAnswer())
+      ws?.send(JSON.stringify({ type: 'answer', payload: { target_id: fromId, sdp: pc.localDescription } }))
+    }
+  } catch (err) {
+    st.settingRemoteAnswer = false
+    // 单条连接的协商异常不能冒泡：否则 WS 消息循环会从这里中断，后续消息全部不再处理
+    console.warn('处理远端 SDP 失败', fromId, description.type, err)
+  }
 }
 
 const handleIce = async (fromId: number, candidate: RTCIceCandidateInit) => {
   const pc = peerConnections.get(fromId)
-  if (pc) await pc.addIceCandidate(new RTCIceCandidate(candidate))
+  if (!pc) return
+  try {
+    await pc.addIceCandidate(new RTCIceCandidate(candidate))
+  } catch (err) {
+    // impolite 方丢弃了碰撞 offer 时，对端为那次协商发出的候选本就无法匹配，
+    // 这类报错属于预期，静默忽略；其余情况仅告警，不得中断消息循环
+    if (!negotiationStateOf(fromId).ignoreOffer) {
+      console.warn('添加 ICE 候选失败', fromId, err)
+    }
+  }
 }
 
 const closePeerConnection = (remoteId: number) => {
+  const timer = peerIssueTimers.get(remoteId)
+  if (timer) {
+    clearTimeout(timer)
+    peerIssueTimers.delete(remoteId)
+  }
   peerConnections.get(remoteId)?.close()
   peerConnections.delete(remoteId)
+  negotiationStates.delete(remoteId)
+  remoteStreams.delete(remoteId)
+  clearPeerIssue(remoteId)
 }
+
+// 已占用的视频席位：自己的（若已开）+ 名单中视频处于开启状态的成员。
+// 由前端按名单自行统计，不再让后端额外下发一份需要保持同步的 used 值。
+const videoSeatUsed = computed(() =>
+  remotePeers.value.filter(p => p.videoOn).length + (videoOn.value ? 1 : 0)
+)
 
 const mapPeer = (p: any): RemotePeer => {
   const old = remotePeers.value.find(x => x.id === p.id)
@@ -1750,6 +2058,9 @@ const mapPeer = (p: any): RemotePeer => {
 const connectWebSocket = (wsUrl: string) => {
   ws = new WebSocket(wsUrl)
   ws.onopen = () => {
+    // 首帧鉴权：token 不再走 URL（URL 会进 access log / 浏览器历史），
+    // 服务端校验通过前不会下发任何会议数据
+    ws?.send(JSON.stringify({ type: 'auth', token: localStorage.getItem('token') || '' }))
     startQualityMonitor()
     if (pingInterval) clearInterval(pingInterval)
     pingInterval = window.setInterval(() => {
@@ -1771,12 +2082,29 @@ const connectWebSocket = (wsUrl: string) => {
           myMuted.value = !!me.muted
           myChatMuted.value = !!me.chat_muted
         }
-        for (const p of remotePeers.value) {
-          await createOfferForPeer(p.id)
+        const rosterIds = new Set(remotePeers.value.map(p => p.id))
+        // 已不在名单里的成员：关闭并回收其连接，避免 PeerConnection 泄漏
+        for (const id of [...peerConnections.keys()]) {
+          if (!rosterIds.has(id)) closePeerConnection(id)
         }
+        // 只为「还没有连接」的新成员建连，已有连接的成员必须复用：
+        // 旧实现无条件重建，导致每次名单刷新都新建一批 PeerConnection
+        //（旧连接未关闭 → 连接泄漏），并把远端视频流重新协商 → 画面闪断。
+        // offer 由 onnegotiationneeded 在 perfect negotiation 流程中自动发起，
+        // 这里不再手动发 offer —— 手动发正是 glare（信令碰撞）的来源。
+        for (const p of remotePeers.value) {
+          ensurePeerConnection(p.id)
+        }
+        // 建连后再同步一次本地轨：本地流晚于连接就绪时靠这里补上
+        syncLocalSenders()
         break
       }
       case 'user_joined':
+        if (remotePeers.value.some(p => p.id === payload.id)) {
+          // 同一人可能被「准入」与「常规加入」两条路径重复广播，
+          // 无条件 push 会让名单里出现重复条目
+          break
+        }
         remotePeers.value.push(mapPeer({
           id: payload.id,
           name: payload.name,
@@ -1832,13 +2160,23 @@ const connectWebSocket = (wsUrl: string) => {
         router.push('/')
         break
       case 'offer':
-        await handleOffer(payload.from_id, payload.sdp)
-        break
       case 'answer':
-        await handleAnswer(payload.from_id, payload.sdp)
+        // offer 与 answer 走同一套 perfect negotiation 处理（见 handleDescription）
+        await handleDescription(payload.from_id, payload.sdp)
         break
       case 'ice':
         await handleIce(payload.from_id, payload.candidate)
+        break
+      case 'video_seat':
+        // 席位上限由后端下发，前端据此展示「视频 N/上限」
+        videoSeatLimit.value = Number(payload.limit) || videoSeatLimit.value
+        break
+      case 'video_denied':
+        // 席位仲裁失败：回滚本地的乐观开启，并保持关闭状态。
+        // 不再回发 device，否则会再次触发一轮仲裁。
+        videoOn.value = false
+        syncLocalSenders()
+        ElMessage.warning(payload.message || '视频席位已满，暂时无法开启摄像头')
         break
       case 'meeting_ended':
         ElMessage.warning('会议已结束')
@@ -2035,8 +2373,13 @@ const cleanup = () => {
     previewStream.value.getTracks().forEach(t => t.stop())
     previewStream.value = null
   }
+  peerIssueTimers.forEach(t => clearTimeout(t))
+  peerIssueTimers.clear()
   peerConnections.forEach(pc => pc.close())
   peerConnections.clear()
+  negotiationStates.clear()
+  remoteStreams.clear()
+  peerIssues.value = {}
   localStream.value?.getTracks().forEach(t => t.stop())
   screenStream.value?.getTracks().forEach(t => t.stop())
   bgStream.value?.getTracks().forEach(t => t.stop())
@@ -2254,6 +2597,30 @@ onUnmounted(() => {
   background: #fdf0ed;
   padding: 1px 5px;
   border-radius: 3px;
+}
+/* 视频席位徽标：贴在摄像头按钮内，显示「视频 已占用/上限」 */
+.seat-badge {
+  font-size: 10px;
+  color: #8b8378;
+  background: #f2eee8;
+  padding: 1px 5px;
+  border-radius: 3px;
+}
+.seat-badge.full {
+  color: #c47a6b;
+  background: #fdf0ed;
+}
+/* 远端连接异常提示：盖在画面上，说明是重连中还是已断开 */
+.peer-issue {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+  color: #fff;
+  font-size: 13px;
+  pointer-events: none;
 }
 
 /* 小头像 */

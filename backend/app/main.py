@@ -10,14 +10,20 @@ from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 import os
 
-from app.database import engine, Base, auto_migrate
+from app.database import engine, Base, auto_migrate, reconcile_ghost_participants
 from app.routers import meeting_router
 from app.routers.auth_router import router as auth_router
+from app.routers.config_router import router as config_router
 from app.websocket_manager import manager
 
 # 创建数据库表 + 自动迁移缺失列
 Base.metadata.create_all(bind=engine)
 auto_migrate()
+
+# 启动对账：进程重启后内存里的 WS 连接已全部丢失，但数据库还留着
+# left_at IS NULL 的参会记录与大于 0 的 participant_count；
+# 不对账就会出现「幽灵在线成员」且会议永远不自动结束（详见该函数 docstring）。
+reconcile_ghost_participants()
 
 # 创建 FastAPI 应用
 app = FastAPI(
@@ -56,6 +62,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 # 注册路由
 app.include_router(meeting_router.router, prefix="/api/v1")
 app.include_router(auth_router)
+app.include_router(config_router)
 
 # 创建录制文件存储目录
 os.makedirs("recordings", exist_ok=True)

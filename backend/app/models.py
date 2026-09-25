@@ -21,6 +21,9 @@ class User(Base):
     cover_url = Column(String(256), nullable=True)    # 封面图
     bio = Column(String(256), nullable=True)          # 个性签名
     verified = Column(Boolean, default=False)         # 认证标识
+    # token 版本：签发 JWT 时写入 ver 声明，改密码 / 重置密码时自增，
+    # 使此前签发的 token 立即失效（JWT 本身无状态，只能靠版本号吊销）
+    token_version = Column(Integer, default=0)
     created_at = Column(DateTime, server_default=func.now())
 
 
@@ -32,6 +35,7 @@ class VerificationCode(Base):
     email = Column(String(64), nullable=False, index=True)
     code = Column(String(6), nullable=False)
     expires_at = Column(DateTime, nullable=False)
+    attempts = Column(Integer, default=0)  # 校验失败次数，超限即作废，防止 6 位码被暴力枚举
     created_at = Column(DateTime, server_default=func.now())
 
 
@@ -70,7 +74,10 @@ class Participant(Base):
     meeting_id = Column(Integer, ForeignKey("meetings.id"), nullable=False, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     display_name = Column(String(64), nullable=False)
-    status = Column(String(16), default="joined")  # joined / waiting / left / kicked
+    status = Column(String(16), default="joined")  # joined / waiting / left / kicked / rejected
+    # 是否曾被正式准入：用于区分「进入过主会场」与「只在等候室待过」，
+    # 防止「进等候室 → 主动断开 → 重连」绕过等候室（断线重连时据此判断是否需重新准入）
+    admitted = Column(Boolean, default=False)
     audio_on = Column(Boolean, default=True)
     video_on = Column(Boolean, default=True)
     sharing_screen = Column(Boolean, default=False)
