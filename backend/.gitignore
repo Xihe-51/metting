@@ -1,0 +1,2 @@
+# 本地部署配置（含 JWT 密钥），只保留 .env.example 入库
+.env
