@@ -17,8 +17,9 @@ import logging
 import random
 import os
 
+from app import rate_limit
 from app.database import get_db, SessionLocal
-from app.config import ALGORITHM, ACCESS_TOKEN_EXPIRE_HOURS, SECRET_KEY
+from app.config import ALGORITHM, ACCESS_TOKEN_EXPIRE_HOURS, SECRET_KEY, load_auth_rate_limits
 from app.models import User, VerificationCode
 from app.schemas import success, error
 
@@ -32,6 +33,33 @@ logger = logging.getLogger("uvicorn.error")
 MAX_CODE_ATTEMPTS = 5
 # 验证码有效期（分钟）
 CODE_TTL_MINUTES = 10
+
+# ============ 认证接口限流（撞库 / 批量注册 / 验证码轰炸防护，见 app/rate_limit.py） ============
+# 阈值均可经环境变量调整（config.load_auth_rate_limits），窗口固定 60s。
+# 局限：计数在单进程内存中，多进程 / 多实例部署时每个进程各算各的。
+AUTH_LIMITS = load_auth_rate_limits()
+AUTH_RATE_WINDOW = 60.0
+
+
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def _too_many(*keys_and_limits) -> bool:
+    """按多个维度分别计数，任一维度超出配额即返回 True
+
+    所有维度都会被计数（不用短路提前返回），否则被某维度拒绝的请求不会计入
+    IP 维度，攻击者换账号继续撞库时 IP 计数就漏了。
+    """
+    allowed = True
+    for key, limit in keys_and_limits:
+        if not rate_limit.hit(key, limit, AUTH_RATE_WINDOW):
+            allowed = False
+    return not allowed
+
+
+def _rate_limited_response():
+    return JSONResponse(status_code=429, content=error(429, "操作过于频繁，请稍后再试"))
 
 
 def _dev_mode_enabled() -> bool:
@@ -140,8 +168,11 @@ def generate_code():
 
 
 @router.post("/register")
-def register(req: RegisterRequest, db: Session = Depends(get_db)):
+def register(req: RegisterRequest, request: Request, db: Session = Depends(get_db)):
     """用户注册"""
+    # 批量注册防护：单 IP 限速（注册接口没有账号维度可限）
+    if _too_many((f"register:ip:{_client_ip(request)}", AUTH_LIMITS["register_per_ip"])):
+        return _rate_limited_response()
     if db.query(User).filter(User.username == req.username).first():
         return JSONResponse(status_code=400, content=error(400, "用户名已存在"))
     if db.query(User).filter(User.email == req.email).first():
@@ -181,8 +212,16 @@ def _authenticate(username: str, password: str):
 
 
 @router.post("/login")
-async def login(req: LoginRequest):
+async def login(req: LoginRequest, request: Request):
     """用户登录（async + 线程池，避免 bcrypt 阻塞事件循环）"""
+    # 撞库防护：单账号 + 单 IP 双维度限速；必须放在线程池之前，
+    # 否则被限流的请求照样会消耗一次 bcrypt 校验（CPU 打满向量）
+    if _too_many(
+        (f"login:user:{req.username}", AUTH_LIMITS["login_per_user"]),
+        (f"login:ip:{_client_ip(request)}", AUTH_LIMITS["login_per_ip"]),
+    ):
+        return _rate_limited_response()
+
     user = await run_in_threadpool(_authenticate, req.username, req.password)
     if not user:
         return JSONResponse(status_code=401, content=error(401, "用户名或密码错误"))
@@ -198,14 +237,22 @@ async def login(req: LoginRequest):
 
 
 @router.post("/send-code")
-def send_code(req: SendCodeRequest, db: Session = Depends(get_db)):
+def send_code(req: SendCodeRequest, request: Request, db: Session = Depends(get_db)):
     """发送验证码（忘记密码）
 
     安全约束：
     1. 响应体默认不回显验证码，验证码只能经邮件等服务端通道下发；
        仅 AUTH_DEV_MODE=1（本地联调/自动化测试）时才在 data.code 中返回。
     2. 无论邮箱是否已注册，都返回完全相同的成功文案，避免账号枚举。
+    3. 单邮箱 + 单 IP 限速：否则可对任意注册邮箱反复触发验证码下发（邮件轰炸），
+       也能靠请求量差异配合其他接口做枚举。
     """
+    if _too_many(
+        (f"send_code:email:{req.email}", AUTH_LIMITS["send_code_per_email"]),
+        (f"send_code:ip:{_client_ip(request)}", AUTH_LIMITS["send_code_per_ip"]),
+    ):
+        return _rate_limited_response()
+
     user = db.query(User).filter(User.email == req.email).first()
 
     code = None
@@ -224,12 +271,19 @@ def send_code(req: SendCodeRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/reset-password")
-def reset_password(req: ResetPasswordRequest, db: Session = Depends(get_db)):
+def reset_password(req: ResetPasswordRequest, request: Request, db: Session = Depends(get_db)):
     """重置密码
 
     安全约束：同一验证码连续校验失败达到 MAX_CODE_ATTEMPTS 次即作废，
-    避免 6 位数字验证码（90 万组合）在 10 分钟有效期内被暴力枚举。
+    避免 6 位数字验证码（90 万组合）在 10 分钟有效期内被暴力枚举；
+    另加单邮箱 + 单 IP 限速，把「靠海量请求稀释 attempts 计数」的路子也堵掉。
     """
+    if _too_many(
+        (f"reset:email:{req.email}", AUTH_LIMITS["reset_per_email"]),
+        (f"reset:ip:{_client_ip(request)}", AUTH_LIMITS["reset_per_ip"]),
+    ):
+        return _rate_limited_response()
+
     vc = db.query(VerificationCode).filter(
         VerificationCode.email == req.email, VerificationCode.code == req.code
     ).first()
@@ -361,6 +415,12 @@ def change_password(
     current_user: User = Depends(require_auth)
 ):
     """修改密码"""
+    # 原密码爆破防护：拿到 token 后仍可无限次试原密码，这里按账号限速；
+    # 必须放在 verify_password（bcrypt）之前
+    if _too_many(
+        (f"change_pwd:user:{current_user.id}", AUTH_LIMITS["change_pwd_per_user"]),
+    ):
+        return _rate_limited_response()
     if not verify_password(req.old_password, current_user.password_hash):
         return JSONResponse(status_code=400, content=error(400, "原密码错误"))
     if len(req.new_password) < 6:
