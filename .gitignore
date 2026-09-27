@@ -1,0 +1,21 @@
+# Python 缓存与字节码（历史已入库的 .pyc 不追溯清理）
+__pycache__/
+*.py[cod]
+
+# SQLite WAL 运行时文件（数据库本体保留跟踪）
+*.db-wal
+*.db-shm
+
+# 端到端测试的临时依赖与后台日志
+e2e-deps/
+*.log
+*.err
+
+# 前端 npm 缓存
+front/.npmcache/
+
+# 内网穿透调试输出
+_tunnel_*
+
+# 本机录制产物（历史已入库的 3 个示例文件不追溯）
+backend/recordings/
