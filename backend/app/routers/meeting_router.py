@@ -10,7 +10,7 @@ from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
 from pydantic import BaseModel
 from typing import Dict, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 import asyncio
 import json
 import secrets
@@ -38,6 +38,16 @@ RATE_WINDOW = 60.0
 
 # 会议号唯一约束冲突后的重试次数
 MAX_MEETING_NO_RETRY = 5
+
+
+def utcnow() -> datetime:
+    """数据库时间列的写入时钟：naive UTC
+
+    models.py 的时间列默认值由 SQLite CURRENT_TIMESTAMP 提供（即 UTC）；
+    Python 侧显式写入（left_at / ended_at 等）必须使用同一时钟，否则与
+    joined_at 这类默认值字段混算会整段偏移（report 参会时长曾因此虚增 8 小时）。
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 # ============ Pydantic 模型（请求） ============
@@ -591,7 +601,7 @@ async def end_meeting(
         return JSONResponse(status_code=403, content=error(403, "仅会议创建者可结束会议"))
 
     meeting.status = "ended"
-    meeting.ended_at = datetime.now()
+    meeting.ended_at = utcnow()
     db.commit()
 
     audit_log(db, meeting.id, current_user.id, "end")
@@ -629,7 +639,7 @@ async def meeting_report(
         Participant.meeting_id == meeting.id
     ).order_by(Participant.joined_at.asc()).all()
 
-    meeting_end = meeting.ended_at or datetime.now()
+    meeting_end = meeting.ended_at or utcnow()
     report_rows = []
     for p in participants:
         joined = p.joined_at
@@ -1260,7 +1270,7 @@ async def _finalize_participant_exit(
         Participant.left_at.is_(None),
         Participant.status.notin_(["kicked", "rejected"])
     ).update(
-        {"left_at": datetime.now(), "status": "left"},
+        {"left_at": utcnow(), "status": "left"},
         synchronize_session=False
     )
     if affected:
@@ -1781,7 +1791,7 @@ async def websocket_endpoint(
                 # 目标必须是本会议且当前在会成员，否则直接忽略（防止跨会议踢人 / 重复扣减计数）
                 if not target_participant or target_participant.left_at is not None:
                     continue
-                target_participant.left_at = datetime.now()
+                target_participant.left_at = utcnow()
                 target_participant.status = "kicked"
                 # 原子 SQL 自减（带 > 0 守卫）：并发踢人/离会时既不丢更新也不写成负数
                 db.query(Meeting).filter(
@@ -1825,7 +1835,7 @@ async def websocket_endpoint(
                 if not target_participant or target_participant.status != "waiting":
                     continue
                 target_participant.status = "rejected"
-                target_participant.left_at = datetime.now()
+                target_participant.left_at = utcnow()
                 # 原子 SQL 自减（带 > 0 守卫）
                 db.query(Meeting).filter(
                     Meeting.id == meeting.id,
@@ -1840,7 +1850,7 @@ async def websocket_endpoint(
 
             elif message_type == "leave_meeting":
                 # 用户主动退出会议
-                participant.left_at = datetime.now()
+                participant.left_at = utcnow()
                 participant.status = "left"
                 participant.video_on = False
                 # 原子 SQL 自减（带 > 0 守卫）

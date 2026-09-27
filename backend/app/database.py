@@ -4,7 +4,7 @@ SQLite + SQLAlchemy 2.0
 """
 from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import sessionmaker, declarative_base
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 
 logger = logging.getLogger("uvicorn.error")
@@ -206,7 +206,9 @@ def reconcile_ghost_participants(target_engine=None) -> dict:
     eng = target_engine if target_engine is not None else engine
     # 显式格式化为字符串再绑定：避免依赖 sqlite3 已废弃的 datetime 隐式适配，
     # 格式与 SQLAlchemy 的 SQLite DATETIME 存储格式一致，ORM 读取时可正常解析。
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+    # 时钟必须与 models.py 的 server_default=func.now()（SQLite CURRENT_TIMESTAMP，
+    # 即 UTC）一致，否则 left_at / ended_at 与 joined_at / created_at 混算会偏移 8 小时。
+    now = datetime.now(timezone.utc).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S.%f")
     with eng.connect() as conn:
         participants_left = conn.execute(text(
             "UPDATE participants SET left_at = :now, status = 'left' "
