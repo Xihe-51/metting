@@ -146,6 +146,30 @@ coturn -c deploy\coturn\turnserver.conf
 - **百兆局域网**：建议全员使用「流畅」画质，或同时把席位降到 2。
 - 提高任何上限前，先确认所有参会者的上行带宽与 CPU 能承担对应增量。
 
+## 接口限流与滥用防护
+
+除媒体容量护栏外，以下接口带频率限制（60 秒滑动窗口，超限返回 429）：
+
+| 接口 | 限流维度 | 默认阈值（次/60s） | 配置项 |
+|------|---------|-------------------|--------|
+| `/api/v1/auth/login` | 单账号 / 单 IP | 10 / 30 | `AUTH_LOGIN_LIMIT_PER_USER` / `AUTH_LOGIN_LIMIT_PER_IP` |
+| `/api/v1/auth/register` | 单 IP | 10 | `AUTH_REGISTER_LIMIT_PER_IP` |
+| `/api/v1/auth/send-code` | 单邮箱 / 单 IP | 5 / 15 | `AUTH_SEND_CODE_LIMIT_PER_EMAIL` / `AUTH_SEND_CODE_LIMIT_PER_IP` |
+| `/api/v1/auth/reset-password` | 单邮箱 / 单 IP | 30 / 30 | `AUTH_RESET_LIMIT_PER_EMAIL` / `AUTH_RESET_LIMIT_PER_IP` |
+| `/api/v1/auth/password` | 单账号 | 10 | `AUTH_CHANGE_PWD_LIMIT_PER_USER` |
+| `/api/v1/meetings/{no}/join` | 单账号 / 单 IP | 30 / 90 | 代码内置（会议号枚举防护） |
+| `/api/v1/meetings/{no}` | 单账号 / 单 IP | 60 / 180 | 代码内置 |
+| WebSocket 消息 | 单连接分档 | 见 `WS_RATE_LIMITS` | 代码内置 |
+
+录制分片另有三层磁盘配额（单片 / 单场 / 目录总量，见 `.env.example` 的
+`REC_MAX_*`），超限返回 413 且不落盘。
+
+**已知局限（重要）**：限流计数保存在**单进程内存**中（`app/rate_limit.py`），
+只适用于当前的单进程 uvicorn 部署。若改为多进程 / 多实例（`--workers > 1`、
+gunicorn、容器多副本），每个进程各自计数，实际放行量 ≈ 阈值 × 进程数；
+需要全局精确限流时必须替换为 Redis 等共享存储。录制配额基于磁盘实际占用与
+文件系统校验，不受多进程影响。
+
 ## API 接口
 
 | 接口 | 方法 | 说明 |

@@ -239,3 +239,43 @@ def load_max_participants() -> int:
     下限必须是 1：至少允许建会者自己入会（建会即占 1 个名额）。
     """
     return _load_positive_int("MEETING_MAX_PARTICIPANTS", DEFAULT_MAX_PARTICIPANTS)
+
+
+# ============ 认证接口限流（撞库 / 批量注册 / 验证码轰炸防护） ============
+# 认证接口原先完全不限速：攻击者可以无限次撞库 /login、反复调用 /send-code
+# 给任意注册邮箱刷验证码、或用脚本批量注册账号。以下阈值按 60s 滑动窗口计数，
+# 任一维度达到即返回 429。注意共享出口 IP（教室 / 机房）下收紧 IP 阈值可能误伤，
+# 调整前先按实际使用人数估算。
+#
+# 局限：计数保存在**单进程内存**中（app/rate_limit.py），多进程 / 多实例部署时
+# 每个进程各算各的，实际放行量会被进程数放大；改为共享存储（Redis）后才能全局生效。
+DEFAULT_AUTH_LOGIN_LIMIT_PER_USER = 10        # /login：单账号 60s 内最多 10 次
+DEFAULT_AUTH_LOGIN_LIMIT_PER_IP = 30          # /login：单 IP 60s 内最多 30 次
+DEFAULT_AUTH_REGISTER_LIMIT_PER_IP = 10       # /register：单 IP 60s 内最多 10 次
+DEFAULT_AUTH_SEND_CODE_LIMIT_PER_EMAIL = 5    # /send-code：单邮箱 60s 内最多 5 次
+DEFAULT_AUTH_SEND_CODE_LIMIT_PER_IP = 15      # /send-code：单 IP 60s 内最多 15 次
+DEFAULT_AUTH_RESET_LIMIT_PER_EMAIL = 30       # /reset-password：单邮箱 60s 内最多 30 次
+DEFAULT_AUTH_RESET_LIMIT_PER_IP = 30          # /reset-password：单 IP 60s 内最多 30 次
+DEFAULT_AUTH_CHANGE_PWD_LIMIT_PER_USER = 10   # /password：单账号 60s 内最多 10 次
+
+
+def load_auth_rate_limits() -> dict:
+    """解析认证接口限流阈值（每个 60s 窗口内的最多次数，见 auth_router.AUTH_LIMITS）"""
+    return {
+        "login_per_user": _load_positive_int(
+            "AUTH_LOGIN_LIMIT_PER_USER", DEFAULT_AUTH_LOGIN_LIMIT_PER_USER),
+        "login_per_ip": _load_positive_int(
+            "AUTH_LOGIN_LIMIT_PER_IP", DEFAULT_AUTH_LOGIN_LIMIT_PER_IP),
+        "register_per_ip": _load_positive_int(
+            "AUTH_REGISTER_LIMIT_PER_IP", DEFAULT_AUTH_REGISTER_LIMIT_PER_IP),
+        "send_code_per_email": _load_positive_int(
+            "AUTH_SEND_CODE_LIMIT_PER_EMAIL", DEFAULT_AUTH_SEND_CODE_LIMIT_PER_EMAIL),
+        "send_code_per_ip": _load_positive_int(
+            "AUTH_SEND_CODE_LIMIT_PER_IP", DEFAULT_AUTH_SEND_CODE_LIMIT_PER_IP),
+        "reset_per_email": _load_positive_int(
+            "AUTH_RESET_LIMIT_PER_EMAIL", DEFAULT_AUTH_RESET_LIMIT_PER_EMAIL),
+        "reset_per_ip": _load_positive_int(
+            "AUTH_RESET_LIMIT_PER_IP", DEFAULT_AUTH_RESET_LIMIT_PER_IP),
+        "change_pwd_per_user": _load_positive_int(
+            "AUTH_CHANGE_PWD_LIMIT_PER_USER", DEFAULT_AUTH_CHANGE_PWD_LIMIT_PER_USER),
+    }

@@ -798,9 +798,19 @@ async def get_audit_logs(
 
 # 录制分片按序组装器：{recording_id: {"expected": 下一个应落盘的分片号, "pending": {分片号: 数据}}}
 _chunk_state: Dict[int, dict] = {}
-# 分片落盘必须串行：多个分片请求会在 await request.body() 处交错，
-# 若无锁保护，「判断序号 → 写文件 → 更新游标」可能被另一个请求穿插而错序。
+# 分片写入必须串行：多个分片请求会在 await request.body() 处交错，
+# 且「配额校验 → 写文件 → 更新游标」一旦分离（先各自读文件大小、再各自落盘），
+# 并发请求会同时通过校验把配额冲爆（TOCTOU）。因此校验与落盘统一放进这把锁。
 _chunk_lock = threading.Lock()
+
+# 录制写入收口标记：{recording_id: 收口时刻（monotonic）}
+# stop_recording 先在此登记（此后该录制一律拒绝新分片），再持锁冲刷缓冲区，
+# 最后才把 DB 状态置为 completed —— 这样「已通过状态检查、却在停止之后才走到写入」
+# 的在途分片会被拦下，保证 completed 之后不再有字节落盘。
+# 标记只需覆盖在途请求这一小段窗口，超过 _CLOSED_TTL 的旧记录可安全回收。
+_CLOSED_TTL = 60.0
+_CLOSED_MAX_KEYS = 256
+_closed_recordings: Dict[int, float] = {}
 
 # 录制目录与配额（导入时校验一次；非法配置会让应用起不来而不是默默放行超大上传）
 RECORDINGS_DIR = "recordings"
@@ -827,43 +837,83 @@ def _recordings_dir_size() -> int:
     return total
 
 
-def _write_chunk_in_order(recording_id: int, file_path: str, seq: int, chunk: bytes):
-    """按分片序号落盘，保证 webm 字节序与录制时序一致
+def _prune_closed_locked() -> None:
+    """回收过期的收口标记（调用方必须已持有 _chunk_lock）"""
+    if len(_closed_recordings) <= _CLOSED_MAX_KEYS:
+        return
+    now = time.monotonic()
+    for rid in [r for r, t in _closed_recordings.items() if now - t > _CLOSED_TTL]:
+        del _closed_recordings[rid]
 
-    MediaRecorder 每 1 秒触发一次 dataavailable，前端并发上传这些分片
-    （见 uploadChunk）。若按 HTTP 到达顺序直接 append，网络抖动会让后生成的分片
-    先落盘，webm 的 EBML / Cluster 结构被破坏，录制文件无法播放
-    —— 即「分片乱序并发上传导致 webm 结构损坏」。
 
-    重排规则：
-      - seq == expected：立即落盘，并继续冲刷缓冲区里后续连续的分片；
-      - seq >  expected：先缓存，等缺失的分片到达后再落盘；
-      - seq <  expected：重复分片，直接丢弃。
+def _close_recording(recording_id: int, file_path: str) -> None:
+    """停止录制前的收口：登记「不再接受分片」，并持锁冲刷缓冲区
+
+    顺序不可交换：必须先登记收口再冲刷。否则新分片会插进冲刷与状态更新之间，
+    把已经收尾的 webm 尾部再次写乱（停止后仍落盘的字节）。
+
+    冲刷说明：正常情况下所有分片都已按序落盘，缓冲区为空；仅当中间某个分片
+    始终没到达（请求彻底丢失）时缓冲区里才有残留，此时按序号升序追加，尽量保住尾部数据。
     """
     with _chunk_lock:
-        state = _chunk_state.setdefault(recording_id, {"expected": 0, "pending": {}})
-        if seq < state["expected"]:
-            return  # 重复分片
-        state["pending"][seq] = chunk
-        with open(file_path, "ab") as f:
-            while state["expected"] in state["pending"]:
-                f.write(state["pending"].pop(state["expected"]))
-                state["expected"] += 1
+        _closed_recordings[recording_id] = time.monotonic()
+        _prune_closed_locked()
 
-
-def _flush_pending_chunks(recording_id: int, file_path: str):
-    """录制结束时冲刷缓冲区
-
-    正常情况下所有分片都已按序落盘，缓冲区为空。仅当中间某个分片始终没到达
-    （请求彻底丢失）时缓冲区里才会残留数据；此时按序号升序追加，尽量保住尾部数据。
-    """
-    with _chunk_lock:
         state = _chunk_state.pop(recording_id, None)
         if not state or not state["pending"]:
             return
         with open(file_path, "ab") as f:
             for seq in sorted(state["pending"]):
                 f.write(state["pending"][seq])
+
+
+def _append_chunk(recording_id: int, file_path: str, seq: Optional[int], chunk: bytes) -> Optional[tuple]:
+    """在锁内完成「配额校验 + 落盘」，返回 None 表示成功，否则返回 (状态码, 提示)
+
+    为什么校验与写入必须在同一把锁里：分离时多个并发分片会各自看到「还有空间」
+    然后一起落盘，把单场 / 目录配额一起冲爆（TOCTOU）。
+    缓冲区中的分片同样计入「已接受字节」——它们已通过校验、迟早会落盘，
+    不计数等于给配额开了绕过口子。
+
+    落盘规则（seq 不为 None 时，保证 webm 字节序与录制时序一致）：
+      - seq == expected：立即落盘，并继续冲刷缓冲区里后续连续的分片；
+      - seq >  expected：先缓存，等缺失的分片到达后再落盘；
+      - seq <  expected：重复分片，直接丢弃。
+    """
+    with _chunk_lock:
+        if recording_id in _closed_recordings:
+            return (400, "录制已结束")
+
+        state = None
+        if seq is not None:
+            state = _chunk_state.setdefault(recording_id, {"expected": 0, "pending": {}})
+            if seq < state["expected"]:
+                return None  # 重复分片：不写、也不占配额
+
+        # 已接受字节 = 磁盘上 + 缓冲区中
+        current = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+        if state:
+            current += sum(len(b) for b in state["pending"].values())
+
+        # 单场配额：本录制已接受字节 + 本片，超过即拒收
+        if current + len(chunk) > RECORDING_QUOTA["max_total_bytes"]:
+            return (413, "本场录制已达存储上限，请停止录制或清理历史录像")
+        # 全局配额：整个 recordings/ 目录的实际占用 + 本片，超过即拒收（防止不断开新会议绕过单场限制）
+        if _recordings_dir_size() + len(chunk) > RECORDING_QUOTA["max_storage_bytes"]:
+            return (413, "服务器录制存储空间不足，请清理历史录像后重试")
+
+        if state is None:
+            # 兼容不带序号的旧客户端：同样持锁顺序追加
+            with open(file_path, "ab") as f:
+                f.write(chunk)
+            return None
+
+        state["pending"][seq] = chunk
+        with open(file_path, "ab") as f:
+            while state["expected"] in state["pending"]:
+                f.write(state["pending"].pop(state["expected"]))
+                state["expected"] += 1
+        return None
 
 
 @router.post("/meetings/{meeting_no}/recordings/start")
@@ -943,8 +993,9 @@ async def stop_recording(
     if meeting.creator_id != current_user.id:
         return JSONResponse(status_code=403, content=error(403, "仅会议创建者可停止录制"))
 
-    # 冲刷缓冲区：若有个别分片因请求彻底丢失而卡在缓冲区，这里按序补写，避免尾部数据丢失
-    _flush_pending_chunks(recording.id, os.path.join(RECORDINGS_DIR, recording.file_name))
+    # 写入收口：先登记「不再接受分片」并持锁冲刷缓冲区，再置 DB 状态。
+    # 顺序反过来的话，已通过状态检查的在途分片会在冲刷之后落盘，把收尾后的文件再写乱。
+    _close_recording(recording.id, os.path.join(RECORDINGS_DIR, recording.file_name))
 
     recording.status = "completed"
     recording.ended_at = datetime.now()
@@ -1025,28 +1076,12 @@ async def upload_recording_chunk(
 
     file_path = os.path.join(RECORDINGS_DIR, recording.file_name)
 
-    # 单场配额：本录制文件已落盘字节 + 本片，超过即拒收
-    current_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
-    if current_size + len(chunk) > RECORDING_QUOTA["max_total_bytes"]:
-        return JSONResponse(
-            status_code=413,
-            content=error(413, "本场录制已达存储上限，请停止录制或清理历史录像")
-        )
-
-    # 全局配额：整个 recordings/ 目录的实际占用 + 本片，超过即拒收（防止不断开新会议绕过单场限制）
-    if _recordings_dir_size() + len(chunk) > RECORDING_QUOTA["max_storage_bytes"]:
-        return JSONResponse(
-            status_code=413,
-            content=error(413, "服务器录制存储空间不足，请清理历史录像后重试")
-        )
-
-    if seq is None:
-        # 兼容不带序号的旧客户端：退化为顺序追加
-        with open(file_path, "ab") as f:
-            f.write(chunk)
-    else:
-        # 按序号重排后落盘：分片是并发上传的，到达顺序不等于录制时序
-        _write_chunk_in_order(recording.id, file_path, seq, chunk)
+    # 单场 / 目录配额校验与落盘在同一把锁内完成（含收口检查），
+    # 避免并发分片各自通过校验后一起超配额落盘
+    result = _append_chunk(recording.id, file_path, seq, chunk)
+    if result is not None:
+        status_code, message = result
+        return JSONResponse(status_code=status_code, content=error(status_code, message))
 
     # 更新文件大小
     recording.file_size = os.path.getsize(file_path)

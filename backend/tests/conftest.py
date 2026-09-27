@@ -41,9 +41,10 @@ def _reset_manager():
     manager.waiting_connections.clear()
     manager.participants_info.clear()
     rate_limit.reset()
-    # 录制分片组装器是模块级字典，且用 recording_id 作键；
+    # 录制分片组装器 / 收口标记是模块级字典，且用 recording_id 作键；
     # 每个用例的临时库都从 id=1 重新计数，不清理会串到下一个用例
     meeting_router._chunk_state.clear()
+    meeting_router._closed_recordings.clear()
 
 
 @pytest.fixture()

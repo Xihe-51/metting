@@ -14,7 +14,10 @@
 - WS 按消息类型分档限流（app/routers/meeting_router.WS_RATE_LIMITS），
   超限丢弃并回 rate_limited 提示，连续超限 WS_MAX_VIOLATIONS 次即 1008 断开；
 - 录制分片三层配额（单片 / 单场 / 目录总量），超限返回 413 且不落盘；
-- run.py 默认关闭 reload；应用启动时 reconcile_ghost_participants() 对账清理。
+- run.py 默认关闭 reload；应用启动时 reconcile_ghost_participants() 对账清理；
+- 认证接口限流（app/routers/auth_router.AUTH_LIMITS，阈值可经环境变量调整）：
+  /login 单账号 + 单 IP、/register 单 IP、/send-code 单邮箱 + 单 IP、
+  /reset-password 单邮箱 + 单 IP、/password 单账号，超限一律 429。
 
 运行：
     cd D:\\meeting\\backend
@@ -30,15 +33,24 @@ from starlette.websockets import WebSocketDisconnect
 from conftest import create_meeting, make_user, participant_id_of  # noqa: E402
 from app import config  # noqa: E402
 from app.config import (  # noqa: E402
+    DEFAULT_AUTH_CHANGE_PWD_LIMIT_PER_USER,
+    DEFAULT_AUTH_LOGIN_LIMIT_PER_IP,
+    DEFAULT_AUTH_LOGIN_LIMIT_PER_USER,
+    DEFAULT_AUTH_REGISTER_LIMIT_PER_IP,
+    DEFAULT_AUTH_RESET_LIMIT_PER_EMAIL,
+    DEFAULT_AUTH_RESET_LIMIT_PER_IP,
+    DEFAULT_AUTH_SEND_CODE_LIMIT_PER_EMAIL,
+    DEFAULT_AUTH_SEND_CODE_LIMIT_PER_IP,
     DEFAULT_REC_MAX_CHUNK_BYTES,
     DEFAULT_REC_MAX_STORAGE_BYTES,
     DEFAULT_REC_MAX_TOTAL_BYTES,
     InsecureConfigError,
+    load_auth_rate_limits,
     load_recording_quota,
 )
 from app.database import Base, create_db_engine, reconcile_ghost_participants  # noqa: E402
 from app.models import Meeting, Participant, User  # noqa: E402
-from app.routers import meeting_router  # noqa: E402
+from app.routers import auth_router, meeting_router  # noqa: E402
 from app.routers.meeting_router import (  # noqa: E402
     WS_MAX_VIOLATIONS,
     WS_RATE_LIMITS,
@@ -470,3 +482,155 @@ def test_run_py_reload_defaults_to_off():
 
     assert "reload=reload_enabled" in src
     assert "reload=True" not in src, "默认开启 reload 会把每次改代码变成一次「全员掉线」"
+
+
+# ==================================================================
+# 认证接口限流（撞库 / 批量注册 / 验证码轰炸）
+# ==================================================================
+
+LOGIN = "/api/v1/auth/login"
+REGISTER = "/api/v1/auth/register"
+SEND_CODE = "/api/v1/auth/send-code"
+RESET = "/api/v1/auth/reset-password"
+CHANGE_PWD = "/api/v1/auth/password"
+
+SMALL_LIMITS = {
+    "login_per_user": 3,
+    "login_per_ip": 5,
+    "register_per_ip": 2,
+    "send_code_per_email": 2,
+    "send_code_per_ip": 4,
+    "reset_per_email": 3,
+    "reset_per_ip": 4,
+    "change_pwd_per_user": 2,
+}
+
+
+@pytest.fixture()
+def small_auth_limits(monkeypatch):
+    """把认证限流阈值改小，便于在少量请求内触发 429"""
+    monkeypatch.setattr(auth_router, "AUTH_LIMITS", dict(SMALL_LIMITS))
+    return SMALL_LIMITS
+
+
+def _login(client, username, password="wrong-password"):
+    return client.post(LOGIN, json={"username": username, "password": password})
+
+
+def test_login_bruteforce_is_rate_limited(client, small_auth_limits, monkeypatch):
+    """攻击复现：对同一账号连续撞库，超出配额后 429，且不再进入密码校验（不消耗 bcrypt）"""
+    checked = []
+    monkeypatch.setattr(auth_router, "_authenticate",
+                        lambda u, p: checked.append(u) or None)
+
+    for _ in range(small_auth_limits["login_per_user"]):
+        assert _login(client, "victim").status_code == 401
+
+    resp = _login(client, "victim")
+    assert resp.status_code == 429, resp.text
+    assert resp.json()["code"] == 429
+    assert len(checked) == small_auth_limits["login_per_user"], \
+        "被限流的请求不得再触发密码校验（否则限流挡不住 CPU 消耗）"
+
+
+def test_login_limit_is_per_account_and_per_ip(client, small_auth_limits, monkeypatch):
+    """边界：账号维度不误伤其他账号；IP 维度配额耗尽后新账号同样被拒"""
+    monkeypatch.setattr(auth_router, "_authenticate", lambda u, p: None)
+
+    for _ in range(small_auth_limits["login_per_user"]):
+        _login(client, "victim")
+    assert _login(client, "victim").status_code == 429
+
+    # 其他账号不受 victim 的账号桶影响（此时 IP 桶已用 4 次，仍在配额内）
+    assert _login(client, "other").status_code == 401, "其他账号不应被 victim 的限流牵连"
+    # 继续请求会耗尽 IP 维度配额（5），此后即便换账号也被拒
+    assert _login(client, "third").status_code == 429
+
+
+def test_send_code_is_rate_limited_per_email(client, small_auth_limits, monkeypatch):
+    """攻击复现：对同一邮箱反复触发验证码下发（邮件轰炸）被 429 拦截"""
+    monkeypatch.delenv("AUTH_DEV_MODE", raising=False)
+
+    for _ in range(small_auth_limits["send_code_per_email"]):
+        assert client.post(SEND_CODE, json={"email": "target@test.local"}).status_code == 200
+
+    resp = client.post(SEND_CODE, json={"email": "target@test.local"})
+    assert resp.status_code == 429, resp.text
+
+    # 换邮箱不受该邮箱桶影响（IP 桶此时用 3 次 < 4）
+    assert client.post(SEND_CODE, json={"email": "other@test.local"}).status_code == 200
+
+
+def test_reset_password_attempts_are_rate_limited(client, small_auth_limits):
+    """攻击复现：对同一邮箱连续猜码，超过配额后 429（与 MAX_CODE_ATTEMPTS 构成双重防护）"""
+    for _ in range(small_auth_limits["reset_per_email"]):
+        resp = client.post(RESET, json={
+            "email": "brute@test.local", "code": "000000", "new_password": "NewPassw0rd!"})
+        assert resp.status_code == 400, resp.text
+
+    resp = client.post(RESET, json={
+        "email": "brute@test.local", "code": "000000", "new_password": "NewPassw0rd!"})
+    assert resp.status_code == 429, resp.text
+
+
+def test_register_is_rate_limited_per_ip(client, small_auth_limits):
+    """攻击复现：脚本批量注册被单 IP 配额拦住（配额内成功，超出即 429）"""
+    def _reg(i):
+        return client.post(REGISTER, json={
+            "username": f"bulk_{i}", "password": "Passw0rd!123",
+            "display_name": f"批量{i}", "email": f"bulk_{i}@test.local",
+        }).status_code
+
+    for i in range(small_auth_limits["register_per_ip"]):
+        assert _reg(i) == 200, f"配额内的第 {i + 1} 个注册不应被拒"
+    assert _reg(99) == 429
+
+
+def test_change_password_attempts_are_rate_limited(client, session_factory, small_auth_limits):
+    """攻击复现：拿到 token 后无限试原密码，被按账号限速"""
+    _, _, headers = make_user(session_factory, "chpwd_s19")
+    body = {"old_password": "wrong-password", "new_password": "NewPassw0rd!"}
+
+    for _ in range(small_auth_limits["change_pwd_per_user"]):
+        assert client.put(CHANGE_PWD, json=body, headers=headers).status_code == 400
+    assert client.put(CHANGE_PWD, json=body, headers=headers).status_code == 429
+
+
+def test_normal_auth_traffic_is_not_limited(client, monkeypatch):
+    """正向对照：默认阈值下正常频率的操作全部放行，限流不误伤真实用户"""
+    monkeypatch.setattr(auth_router, "_authenticate", lambda u, p: None)
+
+    for _ in range(5):
+        assert _login(client, "normal_user").status_code == 401
+    assert client.post(SEND_CODE, json={"email": "normal@test.local"}).status_code == 200
+
+
+def test_auth_rate_limit_config_defaults_and_validation(monkeypatch):
+    """配置校验：默认值可用；非法值（非整数 / 非正数）直接报错"""
+    monkeypatch.setattr(config, "load_env_file", lambda *a, **k: None)
+    for name in (
+        "AUTH_LOGIN_LIMIT_PER_USER", "AUTH_LOGIN_LIMIT_PER_IP",
+        "AUTH_REGISTER_LIMIT_PER_IP", "AUTH_SEND_CODE_LIMIT_PER_EMAIL",
+        "AUTH_SEND_CODE_LIMIT_PER_IP", "AUTH_RESET_LIMIT_PER_EMAIL",
+        "AUTH_RESET_LIMIT_PER_IP", "AUTH_CHANGE_PWD_LIMIT_PER_USER",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    assert load_auth_rate_limits() == {
+        "login_per_user": DEFAULT_AUTH_LOGIN_LIMIT_PER_USER,
+        "login_per_ip": DEFAULT_AUTH_LOGIN_LIMIT_PER_IP,
+        "register_per_ip": DEFAULT_AUTH_REGISTER_LIMIT_PER_IP,
+        "send_code_per_email": DEFAULT_AUTH_SEND_CODE_LIMIT_PER_EMAIL,
+        "send_code_per_ip": DEFAULT_AUTH_SEND_CODE_LIMIT_PER_IP,
+        "reset_per_email": DEFAULT_AUTH_RESET_LIMIT_PER_EMAIL,
+        "reset_per_ip": DEFAULT_AUTH_RESET_LIMIT_PER_IP,
+        "change_pwd_per_user": DEFAULT_AUTH_CHANGE_PWD_LIMIT_PER_USER,
+    }
+
+    monkeypatch.setenv("AUTH_LOGIN_LIMIT_PER_USER", "ten")
+    with pytest.raises(InsecureConfigError):
+        load_auth_rate_limits()
+
+    monkeypatch.setenv("AUTH_LOGIN_LIMIT_PER_USER", "0")
+    with pytest.raises(InsecureConfigError):
+        load_auth_rate_limits()
